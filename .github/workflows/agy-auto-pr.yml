@@ -1,0 +1,292 @@
+name: Reusable AGY Auto PR
+
+on:
+  workflow_call:
+    inputs:
+      allowed_actor:
+        description: "允许触发的 GitHub 用户名"
+        required: false
+        default: "kK-2004"
+        type: string
+      model:
+        description: "项目默认模型（默认 gemini-4-neon-high；显式传空字符串则使用本机 agy 默认模型）"
+        required: false
+        default: "gemini-4-neon-high"
+        type: string
+      effort:
+        description: "项目默认推理强度 (low|medium|high|xhigh|max)"
+        required: false
+        default: "high"
+        type: string
+      mode:
+        description: "agy 沙箱权限模式 (auto 仅放行沙箱内安全操作；accept-edits 仅改文件不跑命令)"
+        required: false
+        default: "auto"
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  agy-auto-pr:
+    # 同时兼容 @agy 和 @gemini，严格限制仅允许指定用户触发
+    if: |
+      (contains(github.event.comment.body, '@agy') || contains(github.event.comment.body, '@gemini')) &&
+      github.event.comment.user.type != 'Bot' &&
+      github.actor == inputs.allowed_actor
+    runs-on: [self-hosted, windows, agy-runner]
+    timeout-minutes: 30
+
+    steps:
+      - name: 标记已接单 (👀) 并解析目标分支
+        id: meta
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
+
+            const defaultBranch = context.payload.repository.default_branch;
+            let checkoutRef = defaultBranch;
+            let targetBase = defaultBranch;
+            const isPr = Boolean(context.payload.issue.pull_request);
+
+            if (isPr) {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.issue.number
+              });
+              if (pr.head.repo && pr.head.repo.full_name === context.payload.repository.full_name) {
+                checkoutRef = pr.head.ref;
+                targetBase = pr.head.ref;
+              }
+            }
+
+            core.setOutput('checkout_ref', checkoutRef);
+            core.setOutput('target_base', targetBase);
+            core.setOutput('is_pr', String(isPr));
+
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.checkout_ref }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: 调用本机 agy 修改代码（沙箱限域 + 三级参数优先级）
+        id: run_agy
+        shell: pwsh
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_EFFORT: ${{ inputs.effort }}
+          INPUT_MODE: ${{ inputs.mode }}
+        run: |
+          [Console]::InputEncoding  = [System.Text.UTF8Encoding]::new($false)
+          [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          $OutputEncoding           = [System.Text.UTF8Encoding]::new($false)
+
+          $validEfforts = @('low', 'medium', 'high', 'xhigh', 'max')
+          $validModes   = @('auto', 'accept-edits', 'plan')
+
+          # 1. 基础值：项目默认 > Org/本机默认
+          $selectedModel  = ([string]$env:INPUT_MODEL).Trim()
+          if ($selectedModel -and $selectedModel -notmatch '^[A-Za-z0-9._:/-]+$') {
+            Write-Warning "项目默认 model '$selectedModel' 包含非法字符，已忽略并回退本机默认模型。"
+            $selectedModel = ''
+          }
+
+          $selectedEffort = ([string]$env:INPUT_EFFORT).Trim().ToLowerInvariant()
+          if ($selectedEffort -notin $validEfforts) {
+            Write-Warning "项目默认 effort '$selectedEffort' 不合法，已回退为 high。"
+            $selectedEffort = 'high'
+          }
+
+          $selectedMode = ([string]$env:INPUT_MODE).Trim().ToLowerInvariant()
+          if ($selectedMode -notin $validModes) {
+            Write-Warning "项目默认 mode '$selectedMode' 不合法，已回退为 auto。"
+            $selectedMode = 'auto'
+          }
+
+          # 2. 最高优先级：解析评论中的临时覆盖参数（--model / model= 与 --effort / effort=）
+          $cleanComment = [string]$env:COMMENT_BODY
+
+          $modelPattern  = '(?i)(?:^|(?<=\s))(?:--model(?:\s+|=)|model=)(?:"([^"\r\n]+)"|''([^''\r\n]+)''|(\S+))'
+          $modelMatches  = [regex]::Matches($cleanComment, $modelPattern)
+          foreach ($m in $modelMatches) {
+            $candidate = ($m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value | Where-Object { $_ } | Select-Object -First 1)
+            if ($candidate) {
+              $candidate = $candidate.Trim()
+              if ($candidate -match '^[A-Za-z0-9._:/-]+$') {
+                $selectedModel = $candidate
+              } else {
+                Write-Warning "评论中的 model '$candidate' 不合法，已忽略。"
+              }
+            }
+          }
+          if ($modelMatches.Count -gt 0) {
+            $cleanComment = [regex]::Replace($cleanComment, $modelPattern, '')
+          }
+
+          $effortPattern = '(?i)(?:^|(?<=\s))(?:--effort(?:\s+|=)|effort=)(?:"([^"\r\n]+)"|''([^''\r\n]+)''|(\S+))'
+          $effortMatches = [regex]::Matches($cleanComment, $effortPattern)
+          foreach ($m in $effortMatches) {
+            $candidate = ($m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value | Where-Object { $_ } | Select-Object -First 1)
+            if ($candidate) {
+              $candidate = $candidate.Trim().ToLowerInvariant()
+              if ($candidate -in $validEfforts) {
+                $selectedEffort = $candidate
+              } else {
+                Write-Warning "评论中的 effort '$candidate' 不合法（仅支持 $($validEfforts -join '|')），已忽略。"
+              }
+            }
+          }
+          if ($effortMatches.Count -gt 0) {
+            $cleanComment = [regex]::Replace($cleanComment, $effortPattern, '')
+          }
+
+          # 清理剥离参数后的多余空白，保留换行结构
+          $cleanComment = ([regex]::Replace($cleanComment, '[ \t]{2,}', ' ')).Trim()
+
+          $usedModelDisplay = if ($selectedModel) { $selectedModel } else { 'default (本机默认)' }
+          Write-Host "生效配置 => model: $usedModelDisplay | effort: $selectedEffort | mode: $selectedMode (sandbox)"
+
+          "used_model=$usedModelDisplay" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "used_effort=$selectedEffort"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "used_mode=$selectedMode"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          # 3. 组装提示词并在沙箱内调用 agy（不读取工作区外文件、不使用 --dangerously-skip-permissions）
+          $outputFile = Join-Path $env:RUNNER_TEMP "agy-output.txt"
+          $rawBody    = [string]$env:ISSUE_BODY
+          $issueBody  = if ($rawBody.Length -gt 12000) { $rawBody.Substring(0, 12000) + "`n...(已截断)" } else { $rawBody }
+
+          $prompt = @"
+          你正在处理 GitHub 仓库中的 #${env:ISSUE_NUMBER} 任务。
+          工作目录严格限定为当前目录（$PWD），禁止读取或修改当前目录以外的任何文件。
+
+          ## 标题
+          ${env:ISSUE_TITLE}
+
+          ## 描述
+          $issueBody
+
+          ## 用户最新指令
+          $cleanComment
+
+          ## 执行要求
+          1. 仅在当前仓库目录内定位问题并修改代码，不要访问工作区外的任何路径。
+          2. 不要修改 .github/workflows/ 下的文件，也不要执行 git commit、git push 或创建 PR。
+          3. 最后用简洁中文总结修改的文件、改动原因和验证结果。
+          "@
+
+          $agyArgs = @(
+            '-p', $prompt,
+            '--sandbox',
+            '--mode', $selectedMode,
+            '--effort', $selectedEffort,
+            '--disable-slash-commands',
+            '--print-timeout', '25m'
+          )
+          if ($selectedModel) {
+            $agyArgs += @('--model', $selectedModel)
+          }
+
+          & agy @agyArgs 2>&1 | Tee-Object -FilePath $outputFile
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "agy 执行失败，退出码: $LASTEXITCODE"
+          }
+
+      - name: 安全检查并自动 Commit / Push 新分支
+        id: git_push
+        shell: pwsh
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          $status = git status --porcelain
+          if ([string]::IsNullOrWhiteSpace($status)) {
+            "has_changes=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
+
+          # 禁止自动修改 .github/workflows/，防止工作流被篡改
+          $changedFiles = @(
+            git diff --name-only
+            git diff --cached --name-only
+            git ls-files --others --exclude-standard
+          ) | Where-Object { $_ } | Sort-Object -Unique
+
+          if ($changedFiles | Where-Object { $_ -like '.github/workflows/*' }) {
+            throw "安全拦截：检测到对 .github/workflows/ 的修改，已中止提交。"
+          }
+
+          $branchName = "agy/fix-$env:ISSUE_NUMBER-$env:RUN_ID"
+          git config user.name "agy-bot"
+          git config user.email "agy-bot@users.noreply.github.com"
+          git checkout -b $branchName
+          git add -A
+          git commit -m "fix: address #$env:ISSUE_NUMBER via agy"
+          git push -u origin $branchName
+
+          "has_changes=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "branch_name=$branchName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: 自动提 PR 并回复评论
+        uses: actions/github-script@v7
+        env:
+          HAS_CHANGES: ${{ steps.git_push.outputs.has_changes }}
+          BRANCH_NAME: ${{ steps.git_push.outputs.branch_name }}
+          TARGET_BASE: ${{ steps.meta.outputs.target_base }}
+          IS_PR: ${{ steps.meta.outputs.is_pr }}
+          USED_MODEL: ${{ steps.run_agy.outputs.used_model }}
+          USED_EFFORT: ${{ steps.run_agy.outputs.used_effort }}
+          USED_MODE: ${{ steps.run_agy.outputs.used_mode }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const outputPath = path.join(process.env.RUNNER_TEMP, 'agy-output.txt');
+            let summary = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : '';
+            if (summary.length > 3000) {
+              summary = '...(已截断前面日志)\n' + summary.slice(-3000);
+            }
+
+            const issueNumber = context.payload.issue.number;
+            const configMeta = `\`model=${process.env.USED_MODEL}\` | \`effort=${process.env.USED_EFFORT}\` | \`mode=${process.env.USED_MODE} (sandbox)\``;
+
+            if (process.env.HAS_CHANGES === 'true') {
+              const closeRef = process.env.IS_PR === 'true' ? `Ref #${issueNumber}` : `Closes #${issueNumber}`;
+              const { data: pr } = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `fix: #${issueNumber} ${context.payload.issue.title}`,
+                head: process.env.BRANCH_NAME,
+                base: process.env.TARGET_BASE,
+                body: `由本机 \`agy\` 自动修改并提交。\n\n**生效配置**：${configMeta}\n\n${closeRef}\n\n### 执行摘要\n\`\`\`\n${summary}\n\`\`\``
+              });
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: `✅ 已通过本机 \`agy\` 完成修改并提交 PR：#${pr.number} (${pr.html_url})\n\n**生效配置**：${configMeta}`
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: `ℹ️ 本机 \`agy\` 已执行完成，但未产生代码变更。\n\n**生效配置**：${configMeta}\n\n<details><summary>查看输出</summary>\n\n\`\`\`\n${summary}\n\`\`\`\n</details>`
+              });
+            }
