@@ -184,9 +184,11 @@ jobs:
           $cleanComment
 
           ## 执行要求
-          1. 仅在当前仓库目录内定位问题并修改代码，不要访问工作区外的任何路径。
-          2. 不要修改 .github/workflows/ 下的文件，也不要执行 git commit、git push 或创建 PR。
-          3. 最后用简洁中文总结修改的文件、改动原因和验证结果。
+          1. 严格限定在当前仓库目录内工作，不要访问工作区外的任何路径。
+          2. 先判断用户意图：
+             - 若用户明确要求修复 bug、实现功能、重构或修改文件：直接修改当前仓库代码，必要时运行相关测试或构建命令验证；最后用简洁中文 Markdown 总结修改的文件、改动原因和验证结果。
+             - 若用户只是提问、代码解释、排查分析或 PR Review（未要求改动文件）：不要修改任何文件，直接基于当前仓库源码用清晰、结构化的中文 Markdown 回答。
+          3. 不要修改 .github/workflows/ 下的文件，也不要执行 git commit、git push 或创建 PR（由后续 CI 步骤自动完成）。
           "@
 
           $agyArgs = @(
@@ -258,8 +260,10 @@ jobs:
             const path = require('path');
             const outputPath = path.join(process.env.RUNNER_TEMP, 'agy-output.txt');
             let summary = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : '';
-            if (summary.length > 3000) {
-              summary = '...(已截断前面日志)\n' + summary.slice(-3000);
+            // 清理终端 ANSI 颜色控制符，确保 GitHub Markdown 干净渲染
+            summary = summary.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim();
+            if (summary.length > 20000) {
+              summary = '...(已截断前面日志)\n\n' + summary.slice(-20000);
             }
 
             const issueNumber = context.payload.issue.number;
@@ -267,26 +271,28 @@ jobs:
 
             if (process.env.HAS_CHANGES === 'true') {
               const closeRef = process.env.IS_PR === 'true' ? `Ref #${issueNumber}` : `Closes #${issueNumber}`;
+              const prSummary = summary || '（无文字摘要输出）';
               const { data: pr } = await github.rest.pulls.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 title: `fix: #${issueNumber} ${context.payload.issue.title}`,
                 head: process.env.BRANCH_NAME,
                 base: process.env.TARGET_BASE,
-                body: `由本机 \`agy\` 自动修改并提交。\n\n**生效配置**：${configMeta}\n\n${closeRef}\n\n### 执行摘要\n\`\`\`\n${summary}\n\`\`\``
+                body: `由本机 \`agy\` 自动修改并提交。\n\n${closeRef}\n\n### 执行摘要\n${prSummary}\n\n---\n<sub>🤖 ${configMeta}</sub>`
               });
 
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: issueNumber,
-                body: `✅ 已通过本机 \`agy\` 完成修改并提交 PR：#${pr.number} (${pr.html_url})\n\n**生效配置**：${configMeta}`
+                body: `✅ 已通过本机 \`agy\` 完成修改并提交 PR：#${pr.number} (${pr.html_url})\n\n<sub>🤖 ${configMeta}</sub>`
               });
             } else {
+              const replyBody = summary || 'ℹ️ 本机 `agy` 已执行完成，未产生代码变更或文本输出。';
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: issueNumber,
-                body: `ℹ️ 本机 \`agy\` 已执行完成，但未产生代码变更。\n\n**生效配置**：${configMeta}\n\n<details><summary>查看输出</summary>\n\n\`\`\`\n${summary}\n\`\`\`\n</details>`
+                body: `${replyBody}\n\n---\n<sub>🤖 由本机 \`agy\` 回复（未改动仓库文件） | ${configMeta}</sub>`
               });
             }
