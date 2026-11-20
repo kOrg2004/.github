@@ -42,7 +42,7 @@ jobs:
     steps:
       - name: 标记已接单 (👀) 并解析目标分支
         id: meta
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             await github.rest.reactions.createForIssueComment({
@@ -74,11 +74,12 @@ jobs:
             core.setOutput('is_pr', String(isPr));
 
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ steps.meta.outputs.checkout_ref }}
           fetch-depth: 0
           persist-credentials: true
+          set-safe-directory: false
 
       - name: 调用本机 agy 修改代码（沙箱限域 + 三级参数优先级）
         id: run_agy
@@ -245,7 +246,7 @@ jobs:
           "branch_name=$branchName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: 自动提 PR 并回复评论
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           HAS_CHANGES: ${{ steps.git_push.outputs.has_changes }}
           BRANCH_NAME: ${{ steps.git_push.outputs.branch_name }}
