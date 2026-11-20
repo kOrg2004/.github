@@ -19,9 +19,9 @@ on:
         default: "high"
         type: string
       mode:
-        description: "agy 沙箱权限模式 (auto 仅放行沙箱内安全操作；accept-edits 仅改文件不跑命令)"
+        description: "agy 沙箱权限模式 (default 使用沙箱默认策略；accept-edits 仅改文件不跑命令；plan 只规划)"
         required: false
-        default: "auto"
+        default: "default"
         type: string
 
 permissions:
@@ -37,7 +37,7 @@ jobs:
       github.event.comment.user.type != 'Bot' &&
       github.actor == inputs.allowed_actor
     runs-on: [self-hosted, windows, agy-runner]
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: 标记已接单 (👀) 并解析目标分支
@@ -98,7 +98,7 @@ jobs:
           $OutputEncoding           = [System.Text.UTF8Encoding]::new($false)
 
           $validEfforts = @('low', 'medium', 'high', 'xhigh', 'max')
-          $validModes   = @('auto', 'accept-edits', 'plan')
+          $validModes   = @('default', 'auto', 'accept-edits', 'plan')
 
           # 1. 基础值：项目默认 > Org/本机默认
           $selectedModel  = ([string]$env:INPUT_MODEL).Trim()
@@ -115,8 +115,8 @@ jobs:
 
           $selectedMode = ([string]$env:INPUT_MODE).Trim().ToLowerInvariant()
           if ($selectedMode -notin $validModes) {
-            Write-Warning "项目默认 mode '$selectedMode' 不合法，已回退为 auto。"
-            $selectedMode = 'auto'
+            Write-Warning "项目默认 mode '$selectedMode' 不合法，已回退为 default。"
+            $selectedMode = 'default'
           }
 
           # 2. 最高优先级：解析评论中的临时覆盖参数（--model / model= 与 --effort / effort=）
@@ -190,16 +190,19 @@ jobs:
              - 若用户明确要求修复 bug、实现功能、重构或修改文件：直接修改当前仓库代码，必要时运行相关测试或构建命令验证；最后用简洁中文 Markdown 总结修改的文件、改动原因和验证结果。
              - 若用户只是提问、代码解释、排查分析或 PR Review（未要求改动文件）：不要修改任何文件，直接基于当前仓库源码用清晰、结构化的中文 Markdown 回答。
           3. 不要修改 .github/workflows/ 下的文件，也不要执行 git commit、git push 或创建 PR（由后续 CI 步骤自动完成）。
+          4. 不要花时间手动递归删除 .pnpm-store 等临时包缓存目录（后续 CI 步骤会自动快速清理，不会提交进仓库）。
           "@
 
           $agyArgs = @(
             '-p', $prompt,
             '--sandbox',
-            '--mode', $selectedMode,
             '--effort', $selectedEffort,
             '--disable-slash-commands',
-            '--print-timeout', '25m'
+            '--print-timeout', '50m'
           )
+          if ($selectedMode -ne 'default') {
+            $agyArgs += @('--mode', $selectedMode)
+          }
           if ($selectedModel) {
             $agyArgs += @('--model', $selectedModel)
           }
@@ -217,6 +220,11 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           RUN_ID: ${{ github.run_id }}
         run: |
+          # 快速清理沙箱运行包管理器时可能产生的未跟踪临时缓存目录（不影响已跟踪文件）
+          if (Test-Path '.pnpm-store') {
+            git clean -fdx -- .pnpm-store | Out-Null
+          }
+
           $status = git status --porcelain
           if ([string]::IsNullOrWhiteSpace($status)) {
             "has_changes=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
@@ -261,8 +269,13 @@ jobs:
             const path = require('path');
             const outputPath = path.join(process.env.RUNNER_TEMP, 'agy-output.txt');
             let summary = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : '';
-            // 清理终端 ANSI 颜色控制符，确保 GitHub Markdown 干净渲染
-            summary = summary.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim();
+            // 清理终端 ANSI 控制符及 CLI 系统提示行，确保 GitHub Markdown 干净渲染
+            summary = summary
+              .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
+              .split(/\r?\n/)
+              .filter((line) => !/^warning: --mode .*$/i.test(line.trim()) && !/^root agent idle; waiting up to .*$/i.test(line.trim()))
+              .join('\n')
+              .trim();
             if (summary.length > 20000) {
               summary = '...(已截断前面日志)\n\n' + summary.slice(-20000);
             }
